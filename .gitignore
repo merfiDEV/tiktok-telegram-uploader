@@ -1,0 +1,11 @@
+/.DS_Store
+/build
+/dist
+/node_modules
+/.env
+/rust/target
+/tiktokautouploader.egg-info
+.history
+/downloads
+/TK_cookies_*.json
+/telegram_bot.log
