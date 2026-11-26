@@ -1,3 +1,3 @@
-const { uploadTiktok, TikTokUploadError } = require('./function');
+const { uploadTiktok, uploadPhotos, TikTokUploadError } = require('./function');
 
-module.exports = { uploadTiktok, TikTokUploadError };
+module.exports = { uploadTiktok, uploadPhotos, TikTokUploadError };

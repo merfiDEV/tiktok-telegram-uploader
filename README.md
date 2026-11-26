@@ -14,6 +14,7 @@
 
 - **Bypass/Auto Solve Captchas:** Captchas won't slow you down, they get solved automatically.
 - **Upload with TikTok Sounds:** Add popular TikTok sounds to your videos. Search by name or pull straight from your favorites.
+- **Native Photo Posts:** Upload 1–35 JPG/PNG/WebP images as a real TikTok photo post (JavaScript port and Telegram bot) — no MP4 conversion needed.
 - **Schedule Uploads:** Queue videos for a specific time, up to 10 days out.
 - **Copyright Check:** Run a copyright check before uploading so you're not caught off guard later.
 - **Add Working Hashtags:** Hashtags that are clickable and actually show up as hashtags instead of text.
@@ -91,6 +92,31 @@ upload_tiktok(video=video_path, description=description, accountname=accountname
 upload_tiktok(video=video_path, description=description, accountname=accountname,
               schedule='03:10', day=11)
 ```
+
+### Native photo posts (JavaScript port)
+
+The JavaScript build exposes `uploadPhotos()` alongside `uploadTiktok()`. It uses TikTok Studio's **Photos** tab, so images stay images — no ffmpeg conversion or fake "image as video" uploads.
+
+```js
+const { uploadPhotos } = require('./tiktokautouploader');
+
+await uploadPhotos(
+  ['photo1.jpg', 'photo2.png'],
+  'My caption',
+  'mytiktokaccount',
+  {
+    title: 'Short title',       // optional, max 90 characters
+    hashtags: ['#fun', '#viral'],
+    soundName: 'trending sound', // optional; 'search' (default) or searchMode: 'favorites'
+    schedule: '18:30',           // optional, minute must be a multiple of 5
+  }
+);
+```
+
+- Up to **35 photos** per post; supported formats: JPG, JPEG, PNG, WebP.
+- `visibility`, `proxy`, `headless`, `stealth`, `suppressprint`, `day` and `searchMode` work the same as for videos.
+- `soundAudVol`, `coverImage` and `copyrightcheck` **do not apply** to photo posts.
+- In the Telegram bot, just send a photo or an album: an album becomes a single photo post.
 
 ### Set a Custom Cover Image
 

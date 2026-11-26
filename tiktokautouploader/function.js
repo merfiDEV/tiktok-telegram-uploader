@@ -9,6 +9,7 @@
 
 const fs = require('fs');
 const https = require('https');
+const path = require('path');
 
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
@@ -30,6 +31,11 @@ class TikTokUploadError extends Error {
 }
 
 const UPLOAD_URL = 'https://www.tiktok.com/tiktokstudio/upload?from=upload&lang=en';
+const PHOTO_UPLOAD_URL = `${UPLOAD_URL}&tab=photo`;
+const PHOTO_POST_URL = 'https://www.tiktok.com/tiktokstudio/upload/post/photo';
+const PHOTO_INPUT_SELECTOR = 'input[type="file"][accept*="image/"]';
+const PHOTO_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
+const MAX_PHOTOS_PER_POST = 35;
 const DRAFT_URL = 'https://www.tiktok.com/tiktokstudio/content?tab=draft';
 const CONTENT_URL = 'https://www.tiktok.com/tiktokstudio/content';
 
@@ -841,6 +847,70 @@ async function setVideoInput(page, video) {
   }
 }
 
+/** Photo posts use their own multi-file input on TikTok Studio's Photos tab. */
+async function setPhotoInput(page, photos) {
+  const list = Array.isArray(photos) ? photos : [photos];
+
+  if (list.length === 0 || list.length > MAX_PHOTOS_PER_POST) {
+    throw new TikTokUploadError(
+      `ERROR: A PHOTO POST NEEDS 1 TO ${MAX_PHOTOS_PER_POST} PHOTOS`
+    );
+  }
+
+  for (const photo of list) {
+    if (!fs.existsSync(`${photo}`)) {
+      throw new TikTokUploadError(`ERROR: PHOTO FILE NOT FOUND: ${photo}`);
+    }
+    const extension = path.extname(`${photo}`).toLowerCase();
+    if (!PHOTO_EXTENSIONS.has(extension)) {
+      throw new TikTokUploadError(
+        `ERROR: UNSUPPORTED PHOTO FORMAT '${extension}'. USE JPG, JPEG, PNG OR WEBP`
+      );
+    }
+  }
+
+  try {
+    await page.setInputFiles(PHOTO_INPUT_SELECTOR, list.map((photo) => `${photo}`));
+  } catch (e) {
+    throw new TikTokUploadError(
+      `ERROR: FAILED TO INPUT PHOTOS: ${e.message}`
+    );
+  }
+}
+
+/**
+ * The video upload page exposes '.upload-text-container'; the photo tab does
+ * not, so wait for the photo input instead while watching for a captcha.
+ */
+async function waitForPhotoUploadOrCaptcha(page) {
+  for (;;) {
+    if ((await page.locator(PHOTO_INPUT_SELECTOR).count()) > 0) {
+      return false;
+    }
+    if (await page.locator(CAPTCHA_QUESTION_SELECTOR).isVisible()) {
+      return true;
+    }
+    await sleep(100);
+  }
+}
+
+async function waitForPhotoReady(page, suppressprint = false) {
+  try {
+    await page.waitForURL('**/upload/post/photo', { timeout: 60000 });
+    await page.waitForSelector('button:has-text("Post")[aria-disabled="false"]', {
+      timeout: 60000,
+    });
+  } catch (e) {
+    throw new TikTokUploadError(
+      'ERROR: TIKTOK DID NOT OPEN THE PHOTO EDITOR. Check the account and try again.'
+    );
+  }
+
+  if (!suppressprint) {
+    console.log('Photos uploaded, photo editor opened');
+  }
+}
+
 async function addDescriptionAndHashtags(
   page,
   sim,
@@ -1181,6 +1251,33 @@ async function addSoundFromUploadPage(
   return soundFail;
 }
 
+/**
+ * Photo posts use a different sound picker: choosing a sound closes the modal
+ * immediately, so there is no volume slider and no "Save" step.
+ */
+async function addSoundToPhotoPost(page, soundName, sim, stealth, suppressprint, searchMode) {
+  if (soundName === null || soundName === undefined) {
+    return false;
+  }
+
+  try {
+    if (stealth) {
+      await sleep(1000);
+    }
+    await page.locator('button:has-text("Add sound")').click({ timeout: 10000 });
+    await sleep(1200);
+  } catch (e) {
+    throw new TikTokUploadError(`ERROR: COULD NOT OPEN SOUND PICKER FOR PHOTO POST: ${e.message}`);
+  }
+
+  await pickSound(page, soundName, sim, stealth, suppressprint, searchMode);
+
+  if (!suppressprint) {
+    console.log('Added sound to photo post');
+  }
+  return true;
+}
+
 async function runUploadCopyrightCheck(page, stealth, suppressprint) {
   let copyCheckCounter = 0;
   if (stealth) {
@@ -1335,6 +1432,58 @@ async function submitUpload(
     await sleep(2000);
     throw new TikTokUploadError(
       'POSSIBLE ERROR UPLOADING: Cannot confirm if uploaded successfully, Please check account in a minute or two to confirm.'
+    );
+  }
+
+  await sleep(1000);
+  await page.close();
+  return null;
+}
+
+/** Publishes a photo post. The photo editor has no data-e2e post button. */
+async function submitPhotoUpload(page, schedule, stealth, suppressprint) {
+  try {
+    if (stealth) {
+      await sleep(1000);
+    }
+
+    const buttonText = schedule === null || schedule === undefined ? 'Post' : 'Schedule';
+    await page
+      .locator(`button:has-text("${buttonText}")[aria-disabled="false"]`)
+      .first()
+      .click({ timeout: 10000 });
+
+    try {
+      await page.locator('button:has-text("Post now")').click({ timeout: 3000 });
+    } catch (e) {
+      /* no confirmation pop-up */
+    }
+
+    try {
+      await page.waitForURL(CONTENT_URL, { timeout: 10000 });
+    } catch (e) {
+      if (!page.url().startsWith(CONTENT_URL)) {
+        if (!suppressprint) {
+          console.log('Could not confirm photo post; check the account in a minute.');
+        }
+        return 'Error';
+      }
+    }
+
+    for (let checks = 0; checks < 25; checks++) {
+      if (await page.locator(':has-text("Leaving the page does not interrupt")').nth(0).isVisible()) {
+        break;
+      }
+      await sleep(200);
+    }
+
+    if (!suppressprint) {
+      console.log('Done uploading photos, NOTE: it may take a minute or two to show on TikTok');
+    }
+  } catch (e) {
+    await sleep(1000);
+    throw new TikTokUploadError(
+      'POSSIBLE ERROR UPLOADING PHOTOS: Cannot confirm if uploaded successfully, please check the account in a minute or two.'
     );
   }
 
@@ -1686,16 +1835,148 @@ async function uploadTiktok(
   }
 }
 
+/**
+ * UPLOADS A NATIVE TIKTOK PHOTO POST (1–35 images, no video conversion).
+ * --------------------------------------------------------------------------------
+ * @param {string[]|string} photos paths to JPG/JPEG/PNG/WebP files
+ * @param {string} description caption for the post
+ * @param {string} accountname account to upload on (TK_cookies_<accountname>.json)
+ * @param {object} [options]
+ * @param {string} [options.title] optional 90-character title shown above the caption
+ * @param {string[]} [options.hashtags] hashtags, with or without '#'
+ * @param {string} [options.soundName] sound to search for or take from favorites
+ * @param {string} [options.soundAudVol] accepted for compatibility; photo posts have no volume control
+ * @param {string} [options.schedule] 'HH:MM' local time, minute must be a multiple of 5
+ * @param {number|string} [options.day] day-of-month (requires schedule)
+ * @param {string} [options.visibility] 'everyone' (default), 'friends' or 'private'
+ * @param {string} [options.searchMode] 'search' or 'favorites'
+ * @param {boolean} [options.suppressprint] true means the function prints nothing
+ * @param {boolean} [options.headless] run in headless mode or not
+ * @param {boolean} [options.stealth] extra delays between browser actions
+ * @param {object} [options.proxy] proxy server configuration
+ * @returns {Promise<string>} 'Completed' or 'Error'
+ */
+async function uploadPhotos(
+  photos,
+  description,
+  accountname,
+  {
+    title = null,
+    hashtags = null,
+    soundName = null,
+    soundAudVol = 'mix',
+    schedule = null,
+    day = null,
+    visibility = 'everyone',
+    searchMode = 'search',
+    suppressprint = false,
+    headless = true,
+    stealth = false,
+    proxy = null,
+  } = {}
+) {
+  // soundAudVol is accepted so photo callers can share the video options object;
+  // TikTok's photo editor does not expose separate music volume sliders.
+  void soundAudVol;
+
+  try {
+    await checkForUpdates();
+  } catch (e) {
+    await sleep(100);
+  }
+
+  try {
+    await validateProxy(proxy);
+  } catch (e) {
+    throw new TikTokUploadError(`Error validating proxy: ${e.message}`);
+  }
+
+  if (accountname === null || accountname === undefined) {
+    throw new TikTokUploadError(
+      'PLEASE ENTER NAME OF ACCOUNT TO POST ON, READ DOCUMENTATION FOR MORE INFO'
+    );
+  }
+
+  const cookies = await loadOrCreateCookies(accountname, proxy);
+  const { browser, context } = await makeStealthContext(headless, proxy);
+
+  try {
+    await context.addCookies(cookies);
+    const page = await context.newPage();
+    const sim = new UserSimulator(page);
+
+    if (!suppressprint) {
+      console.log(`Uploading photos to account '${accountname}'`);
+    }
+
+    await gotoWithRetry(page, PHOTO_UPLOAD_URL);
+    const captcha = await waitForPhotoUploadOrCaptcha(page);
+    if (captcha) {
+      await solveCaptchaIfNeeded(page, suppressprint);
+    }
+
+    await setPhotoInput(page, photos);
+    await waitForPhotoReady(page, suppressprint);
+
+    await addDescriptionAndHashtags(
+      page,
+      sim,
+      Array.isArray(photos) ? photos.join(' ') : photos,
+      description,
+      hashtags,
+      stealth,
+      suppressprint
+    );
+
+    if (title !== null && title !== undefined) {
+      const titleInput = page.locator('input[placeholder="Add a catchy title"]');
+      if ((await titleInput.count()) > 0) {
+        await titleInput.fill(`${title}`.slice(0, 90));
+      }
+    }
+
+    if (visibility && `${visibility}`.toLowerCase() !== 'everyone') {
+      await setVisibility(page, visibility, suppressprint);
+    }
+
+    await sim.simulateBrowsing(800);
+
+    [schedule, day] = normalizeScheduleAndDay(schedule, day);
+    validateScheduleRequest(schedule, day);
+    await applySchedule(page, schedule, day, stealth, suppressprint);
+
+    await addSoundToPhotoPost(page, soundName, sim, stealth, suppressprint, searchMode);
+
+    const result = await submitPhotoUpload(page, schedule, stealth, suppressprint);
+    if (result === 'Error') {
+      return 'Error';
+    }
+
+    return 'Completed';
+  } finally {
+    try {
+      await browser.close();
+    } catch (e) {
+      /* browser may already be closed */
+    }
+  }
+}
+
 module.exports = {
   uploadTiktok,
+  uploadPhotos,
   TikTokUploadError,
   // Selectors and helpers exported the way Python exposed module-level names.
   UPLOAD_URL,
+  PHOTO_UPLOAD_URL,
+  PHOTO_POST_URL,
+  PHOTO_INPUT_SELECTOR,
+  MAX_PHOTOS_PER_POST,
   DRAFT_URL,
   CONTENT_URL,
 
-  // Individual steps, exported so the Rust layer can drive the flow through
-  // bridge/server.js instead of re-implementing the DOM work.
+  // Individual steps exported for callers that want to drive the DOM flow
+  // directly instead of using uploadTiktok()/uploadPhotos().
   checkExpiry,
   readCookies,
   cookieFile,
@@ -1707,6 +1988,9 @@ module.exports = {
   waitForUploadOrCaptcha,
   solveCaptchaIfNeeded,
   setVideoInput,
+  setPhotoInput,
+  waitForPhotoUploadOrCaptcha,
+  waitForPhotoReady,
   addDescriptionAndHashtags,
   waitForUploadReady,
   setVisibility,
@@ -1714,7 +1998,9 @@ module.exports = {
   validateScheduleRequest,
   applySchedule,
   addSoundFromUploadPage,
+  addSoundToPhotoPost,
   runUploadCopyrightCheck,
   selectCoverLastFrame,
   submitUpload,
+  submitPhotoUpload,
 };

@@ -10,7 +10,7 @@ This file provides context for AI coding agents working on this repository.
 
 **PyPI package:** `tiktokautouploader`  
 **Primary entry point:** `tiktokautouploader/function.py` → `upload_tiktok()`  
-**Public API surface:** `tiktokautouploader/__init__.py` (exports only `upload_tiktok`)
+**Public API surface:** `tiktokautouploader/__init__.py` (exports only `upload_tiktok` in the Python package); the JavaScript port's `tiktokautouploader/index.js` exports `uploadTiktok` **and** `uploadPhotos` (native photo posts).
 
 ---
 
@@ -97,6 +97,20 @@ upload_tiktok(
 ) -> str                  # Returns 'Completed' or 'Error'
 ```
 
+The JavaScript port also exposes native photo posts:
+
+```js
+uploadPhotos(
+  photos,          // string[] of 1–35 JPG/JPEG/PNG/WebP paths
+  description,     // caption text
+  accountname,     // same cookie-file convention as uploadTiktok
+  options          // title, hashtags, soundName, searchMode, schedule,
+                   // day, visibility, proxy, headless, stealth, suppressprint
+) -> Promise<'Completed' | 'Error'>
+```
+
+Photo posts use TikTok Studio's Photos tab (`?tab=photo` → `/upload/post/photo`) and its `input[type="file"][accept*="image/"]` (multiple). They have no video cover editor or copyright check; `soundAudVol` is ignored.
+
 ---
 
 ## Internal Architecture
@@ -110,11 +124,13 @@ upload_tiktok(
 | `_goto_with_retry()` | Navigate with 2-attempt retry |
 | `_wait_for_upload_or_captcha()` | Poll until upload UI or captcha appears |
 | `_solve_captcha_if_needed()` | Roboflow-based captcha solver |
-| `_set_video_input()` | File input injection |
+| `_set_video_input()` | Video file input injection |
+| `setPhotoInput()` / `waitForPhotoUploadOrCaptcha()` / `waitForPhotoReady()` | Photo tab injection, captcha detection and photo-editor readiness (JS port) |
 | `_add_description_and_hashtags()` | Type description + click hashtag suggestions |
 | `_wait_for_upload_ready()` | Wait for TikTok to finish processing the video |
 | `_apply_schedule()` | Interact with date/time picker |
 | `_add_sound_from_upload_page()` | Open Sounds panel, search/select, adjust volume |
+| `addSoundToPhotoPost()` / `submitPhotoUpload()` | Photo sound picker (no Save/volume step) and photo post submission (JS port) |
 | `_run_upload_copyright_check()` | Toggle copyright check and wait for result |
 | `_submit_upload()` | Click Post/Schedule and confirm success |
 

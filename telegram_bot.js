@@ -4,7 +4,8 @@
  *
  * Возможности:
  *  - присылаете одно или несколько видео (файлом или как видео) — они встают в очередь;
- *  - подпись к видео сразу становится описанием, описание можно поменять кнопкой «✏️ Описание»;
+ *  - присылаете фото или альбом фото — они заливаются нативным фото-постом TikTok (до 35 фото в одном посте);
+ *  - подпись к видео/фото сразу становится описанием, описание можно поменять кнопкой «✏️ Описание»;
  *  - присылаете ссылку — бот скачивает видео через yt-dlp и предлагает залить его на аккаунт;
  *  - «🚀 Залить все» отправляет на TikTok все готовые видео по очереди (одно за другим).
  *
@@ -27,7 +28,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const TelegramBot = require('node-telegram-bot-api');
 
-const { uploadTiktok, TikTokUploadError } = require('./tiktokautouploader');
+const { uploadTiktok, uploadPhotos, TikTokUploadError } = require('./tiktokautouploader');
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!TOKEN) {
@@ -51,6 +52,10 @@ const DEFAULT_HASHTAGS = (process.env.TIKTOK_HASHTAGS || '')
   .map((tag) => (tag.startsWith('#') ? tag : `#${tag}`));
 
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi']);
+const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
+const MAX_PHOTOS_PER_POST = 35;
+/** Ждём остальные фото альбома перед созданием одного поста. */
+const ALBUM_DEBOUNCE_MS = 900;
 const MAX_DESCRIPTION_LENGTH = 2200;
 const LINK_RE = /https?:\/\/[^\s<>"']+/gi;
 const DOWNLOAD_TIMEOUT_MS = 15 * 60 * 1000;
@@ -60,7 +65,7 @@ const bot = new TelegramBot(TOKEN, { polling: true });
 let account = process.env.TIKTOK_ACCOUNT || '';
 let hashtags = DEFAULT_HASHTAGS;
 
-/** @type {Map<number, {id:number, chatId:number, file:string, description:string, status:string}>} */
+/** @type {Map<number, {id:number, chatId:number, kind:string, file:string, files:string[], label:string, description:string, status:string}>} */
 const tasks = new Map();
 let nextTaskId = 1;
 
@@ -69,6 +74,9 @@ const awaitingDescription = new Map();
 
 /** chatId -> очередь задач, для которых ещё нужно спросить описание */
 const descriptionQueues = new Map();
+
+/** media_group_id -> собранные сообщения альбома фото */
+const photoAlbums = new Map();
 
 const uploadQueue = [];
 let workerRunning = false;
@@ -97,11 +105,20 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;');
 }
 
-function addTask(chatId, { file = null, label = '', description = '', status = 'ready' }) {
+function addTask(chatId, {
+  kind = 'video',
+  file = null,
+  files = [],
+  label = '',
+  description = '',
+  status = 'ready',
+}) {
   const task = {
     id: nextTaskId++,
     chatId,
+    kind,
     file,
+    files,
     label,
     description: description.slice(0, MAX_DESCRIPTION_LENGTH),
     status,
@@ -112,8 +129,18 @@ function addTask(chatId, { file = null, label = '', description = '', status = '
 }
 
 function taskName(task) {
+  if (task.kind === 'photo') {
+    return task.label || `${task.files.length} фото`;
+  }
   if (task.file) return path.basename(task.file);
   return task.label || 'видео';
+}
+
+function removeTaskFiles(task) {
+  removeFile(task.file);
+  for (const file of task.files || []) removeFile(file);
+  task.file = null;
+  task.files = [];
 }
 
 function taskCard(task) {
@@ -123,8 +150,9 @@ function taskCard(task) {
       : task.description
     : '— не задано';
 
+  const icon = task.kind === 'photo' ? '📷' : '🎬';
   return (
-    `🎬 <b>#${task.id}</b> · ${STATUS_LABELS[task.status] || task.status}\n` +
+    `${icon} <b>#${task.id}</b> · ${STATUS_LABELS[task.status] || task.status}\n` +
     `Файл: <code>${escapeHtml(taskName(task))}</code>\n` +
     `Описание: ${escapeHtml(description)}`
   );
@@ -389,6 +417,14 @@ function enqueueTask(task) {
   if (task.status === 'queued' || task.status === 'uploading' || task.status === 'done') {
     return;
   }
+  if (
+    task.kind === 'photo'
+      ? !Array.isArray(task.files) || task.files.length === 0
+      : !task.file
+  ) {
+    bot.sendMessage(task.chatId, `⚠️ Файлы задачи #${task.id} ещё не скачаны.`);
+    return;
+  }
   if (!account) {
     bot.sendMessage(
       task.chatId,
@@ -420,9 +456,14 @@ async function runWorker() {
           { parse_mode: 'HTML' }
         );
 
-        const result = await uploadTiktok(task.file, task.description, account, {
-          hashtags: hashtags.length > 0 ? hashtags : null,
-        });
+        const result =
+          task.kind === 'photo'
+            ? await uploadPhotos(task.files, task.description, account, {
+                hashtags: hashtags.length > 0 ? hashtags : null,
+              })
+            : await uploadTiktok(task.file, task.description, account, {
+                hashtags: hashtags.length > 0 ? hashtags : null,
+              });
 
         if (result !== 'Completed') {
           throw new Error(`uploadTiktok вернул «${result}»`);
@@ -431,8 +472,7 @@ async function runWorker() {
         task.status = 'done';
         scheduleBoardUpdate(task.chatId);
         await bot.sendMessage(task.chatId, `✅ #${task.id} успешно залито на аккаунт «${account}».`);
-        removeFile(task.file);
-        task.file = null;
+        removeTaskFiles(task);
       } catch (error) {
         task.status = 'failed';
         task.error =
@@ -484,6 +524,88 @@ async function handleVideoMessage(msg) {
         'Телеграм отдаёт ботам файлы до 20 МБ — большое видео пришлите ссылкой.'
     );
   }
+}
+
+function photoFileId(msg) {
+  if (Array.isArray(msg.photo) && msg.photo.length > 0) {
+    // Telegram присылает несколько размеров; последний — самый большой.
+    return msg.photo[msg.photo.length - 1].file_id;
+  }
+  return msg.document?.file_id || null;
+}
+
+function photoExtension(msg) {
+  if (msg.document?.file_name) {
+    const extension = path.extname(msg.document.file_name).toLowerCase();
+    if (IMAGE_EXTENSIONS.has(extension)) return extension;
+  }
+  const mimeMap = {
+    'image/jpeg': '.jpg',
+    'image/jpg': '.jpg',
+    'image/png': '.png',
+    'image/webp': '.webp',
+  };
+  return mimeMap[msg.document?.mime_type] || '.jpg';
+}
+
+async function createPhotoTask(chatId, messages) {
+  const selected = messages.slice(0, MAX_PHOTOS_PER_POST);
+  const task = addTask(chatId, {
+    kind: 'photo',
+    files: [],
+    label: selected.length > 1 ? `${selected.length} фото` : 'фото из Telegram',
+    description: messages.map((msg) => msg.caption).find(Boolean) || '',
+    status: 'downloading',
+  });
+  scheduleBoardUpdate(chatId);
+
+  try {
+    if (!messages[0]?.media_group_id) {
+      await bot.sendMessage(chatId, `⬇️ Скачиваю фото #${task.id}…`);
+    }
+
+    for (const msg of selected) {
+      const fileId = photoFileId(msg);
+      if (!fileId) throw new Error('В сообщении нет фото');
+      task.files.push(await downloadTelegramFile(fileId, photoExtension(msg)));
+    }
+
+    task.status = 'ready';
+    scheduleBoardUpdate(chatId);
+    await sendTaskCard(chatId, task);
+  } catch (error) {
+    task.status = 'failed';
+    task.error = error.message;
+    scheduleBoardUpdate(chatId);
+    await bot.sendMessage(chatId, `❌ Не удалось скачать фото #${task.id}: ${error.message}`);
+  }
+}
+
+/** Альбом приходит несколькими сообщениями — собираем их в один фото-пост. */
+async function handlePhotoMessage(msg) {
+  const chatId = msg.chat.id;
+  const groupId = msg.media_group_id;
+
+  if (!groupId) {
+    await createPhotoTask(chatId, [msg]);
+    return;
+  }
+
+  let album = photoAlbums.get(groupId);
+  if (!album) {
+    album = { chatId, messages: [], timer: null };
+    photoAlbums.set(groupId, album);
+  }
+  album.messages.push(msg);
+
+  if (album.timer) clearTimeout(album.timer);
+  album.timer = setTimeout(() => {
+    album.timer = null;
+    photoAlbums.delete(groupId);
+    createPhotoTask(album.chatId, album.messages).catch((error) =>
+      console.error('Ошибка обработки альбома фото:', error.message)
+    );
+  }, ALBUM_DEBOUNCE_MS);
 }
 
 /** Разбирает текст на пары «ссылка | описание» (описание необязательно). */
@@ -586,10 +708,11 @@ function helpText() {
   return (
     '📚 <b>Как пользоваться</b>\n\n' +
     '1. Пришлите одно или несколько видео (обычным видео или файлом).\n' +
-    '2. Пришлите одну или несколько ссылок — каждую с новой строки. Бот скачает всё пачкой и по очереди предложит описание для каждого видео.\n' +
-    '3. Подпись к видео или текст после «|» в строке со ссылкой сразу станет описанием:\n' +
+    '2. Пришлите фото или альбом фото — бот сделает нативный фото-пост TikTok (до 35 фото в альбоме).\n' +
+    '3. Пришлите одну или несколько ссылок — каждую с новой строки. Бот скачает всё пачкой и по очереди предложит описание.\n' +
+    '4. Подпись к видео/фото или текст после «|» в строке со ссылкой сразу станет описанием:\n' +
     '    <code>https://... | мое описание</code>\n' +
-    '4. Нажмите «🚀 Залить на аккаунт» для одного видео или «🚀 Залить все» для всей пачки.\n\n' +
+    '5. Нажмите «🚀 Залить на аккаунт» для одного файла или «🚀 Залить все» для всей пачки.\n\n' +
     '<b>Команды</b>\n' +
     '/queue — показать очередь скачивания и заливки\n' +
     '/list — список видео и описаний\n' +
@@ -634,7 +757,7 @@ async function handleCommand(msg) {
     case '/queue': {
       const chatTasks = [...tasks.values()].filter((task) => task.chatId === chatId);
       if (chatTasks.length === 0) {
-        await bot.sendMessage(chatId, 'Очередь пуста. Пришлите видео или ссылку.');
+        await bot.sendMessage(chatId, 'Очередь пуста. Пришлите видео, фото или ссылку.');
         return;
       }
       await renderBoard(chatId);
@@ -648,7 +771,7 @@ async function handleCommand(msg) {
     case '/list': {
       const chatTasks = [...tasks.values()].filter((task) => task.chatId === chatId);
       if (chatTasks.length === 0) {
-        await bot.sendMessage(chatId, 'Очередь пуста. Пришлите видео или ссылку.');
+        await bot.sendMessage(chatId, 'Очередь пуста. Пришлите видео, фото или ссылку.');
         return;
       }
       // Telegram ограничивает сообщение 4096 символами — отправляем частями.
@@ -674,7 +797,7 @@ async function handleCommand(msg) {
       }
       const task = tasks.get(Number(match[1]));
       if (!task || task.chatId !== chatId) {
-        await bot.sendMessage(chatId, `Видео #${match[1]} не найдено.`);
+        await bot.sendMessage(chatId, `Задача #${match[1]} не найдена.`);
         return;
       }
       const description = match[2].trim();
@@ -708,7 +831,7 @@ async function handleCommand(msg) {
       for (const id of ids) {
         const task = tasks.get(id);
         if (!task || task.chatId !== chatId) {
-          await bot.sendMessage(chatId, `Видео #${id} не найдено.`);
+          await bot.sendMessage(chatId, `Задача #${id} не найдена.`);
           continue;
         }
         enqueueTask(task);
@@ -721,7 +844,7 @@ async function handleCommand(msg) {
         (task) => task.chatId === chatId && task.status === 'ready'
       );
       if (ready.length === 0) {
-        await bot.sendMessage(chatId, 'Нет готовых к заливке видео.');
+        await bot.sendMessage(chatId, 'Нет готовых к заливке файлов.');
         return;
       }
       for (const task of ready) enqueueTask(task);
@@ -736,7 +859,7 @@ async function handleCommand(msg) {
         return;
       }
       if (task.status === 'uploading') {
-        await bot.sendMessage(chatId, 'Это видео уже заливается, дождитесь окончания.');
+        await bot.sendMessage(chatId, 'Эта задача уже заливается, дождитесь окончания.');
         return;
       }
       tasks.delete(id);
@@ -752,7 +875,7 @@ async function handleCommand(msg) {
         return;
       }
       awaitingDescription.delete(chatId);
-      await bot.sendMessage(chatId, '⏭ Пропустил это видео.');
+      await bot.sendMessage(chatId, '⏭ Пропустил эту задачу.');
       await askNextDescription(chatId);
       return;
 
@@ -772,6 +895,11 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
 
   try {
+    if (msg.photo || (msg.document && isImageDocument(msg.document))) {
+      await handlePhotoMessage(msg);
+      return;
+    }
+
     if (msg.video || (msg.document && isVideoDocument(msg.document))) {
       await handleVideoMessage(msg);
       return;
@@ -790,7 +918,7 @@ bot.on('message', async (msg) => {
       const task = tasks.get(taskId);
 
       if (!task) {
-        await bot.sendMessage(chatId, 'Видео уже удалено, описание не сохранено.');
+        await bot.sendMessage(chatId, 'Файл уже удалён, описание не сохранено.');
         await askNextDescription(chatId);
         return;
       }
@@ -808,7 +936,7 @@ bot.on('message', async (msg) => {
       return;
     }
 
-    await bot.sendMessage(chatId, 'Пришлите видео, ссылку или /help.');
+    await bot.sendMessage(chatId, 'Пришлите видео, фото, ссылку или /help.');
   } catch (error) {
     console.error('Ошибка обработки сообщения:', error);
     await bot.sendMessage(chatId, `❌ Внутренняя ошибка: ${error.message}`);
@@ -820,6 +948,12 @@ function isVideoDocument(document) {
   if (document.mime_type && document.mime_type.startsWith('video/')) return true;
   const extension = path.extname(document.file_name || '').toLowerCase();
   return VIDEO_EXTENSIONS.has(extension);
+}
+
+function isImageDocument(document) {
+  if (!document) return false;
+  if (document.mime_type && document.mime_type.startsWith('image/')) return true;
+  return IMAGE_EXTENSIONS.has(path.extname(document.file_name || '').toLowerCase());
 }
 
 bot.on('callback_query', async (query) => {
@@ -837,15 +971,16 @@ bot.on('callback_query', async (query) => {
     if (action === 'desc') {
       const task = tasks.get(taskId);
       if (!task || task.chatId !== chatId) {
-        await bot.answerCallbackQuery(query.id, { text: 'Видео не найдено' });
+        await bot.answerCallbackQuery(query.id, { text: 'Задача не найдена' });
         return;
       }
       awaitingDescription.set(chatId, task.id);
       await bot.answerCallbackQuery(query.id);
       await bot.sendMessage(
         chatId,
-        `✏️ Описание для #${task.id}: ${path.basename(task.file)}\n` +
-          'Отправьте текст описания или /skip, чтобы пропустить.'
+        `✏️ Описание для #${task.id}: ${escapeHtml(taskName(task))}\n` +
+          'Отправьте текст описания или /skip, чтобы пропустить.',
+        { parse_mode: 'HTML' }
       );
       return;
     }
@@ -853,7 +988,7 @@ bot.on('callback_query', async (query) => {
     if (action === 'up') {
       const task = tasks.get(taskId);
       if (!task || task.chatId !== chatId) {
-        await bot.answerCallbackQuery(query.id, { text: 'Видео не найдено' });
+        await bot.answerCallbackQuery(query.id, { text: 'Задача не найдена' });
         return;
       }
       await bot.answerCallbackQuery(query.id);
@@ -867,7 +1002,7 @@ bot.on('callback_query', async (query) => {
       );
       await bot.answerCallbackQuery(query.id);
       if (ready.length === 0) {
-        await bot.sendMessage(chatId, 'Нет готовых к заливке видео.');
+        await bot.sendMessage(chatId, 'Нет готовых к заливке файлов.');
         return;
       }
       for (const task of ready) enqueueTask(task);
@@ -877,7 +1012,7 @@ bot.on('callback_query', async (query) => {
     if (action === 'del') {
       const task = tasks.get(taskId);
       if (!task || task.chatId !== chatId) {
-        await bot.answerCallbackQuery(query.id, { text: 'Видео не найдено' });
+        await bot.answerCallbackQuery(query.id, { text: 'Задача не найдена' });
         return;
       }
       if (task.status === 'uploading') {
@@ -885,7 +1020,7 @@ bot.on('callback_query', async (query) => {
         return;
       }
       tasks.delete(task.id);
-      removeFile(task.file);
+      removeTaskFiles(task);
       scheduleBoardUpdate(chatId);
       await bot.answerCallbackQuery(query.id, { text: 'Удалено' });
       await bot.editMessageReplyMarkup(
