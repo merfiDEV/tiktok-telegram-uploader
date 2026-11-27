@@ -1,207 +1,156 @@
-<div align="center">
-  <h1>tiktokautouploader</h1>
-</div>
+# tiktok-telegram-uploader
 
-### AUTOMATE TIKTOK UPLOADS. USE TRENDING/FAVORITED SOUNDS, ADD WORKING HASHTAGS, SCHEDULE UPLOADS, AUTOSOLVES CAPTCHAS, AND MORE
+Автоматическая загрузка видео и нативных фото-постов в TikTok через браузер + Telegram-бот для пакетной отправки файлов и ссылок.
 
-[![PyPI version](https://img.shields.io/pypi/v/tiktokautouploader.svg)](https://pypi.org/project/tiktokautouploader/) WORKING AS OF FEB 2026 (sound_aud_vol issues only, use default ```sound_aud_vol='mix'```)
+## Возможности
 
-<p align="center">
-  <img src="READMEimage/READMEGIF.gif" alt="" width="900"/>
-</p>
+- Загрузка видео и фото/альбомов (до 35 изображений в одном посте).
+- Описание, хэштеги, звуки из поиска или из избранного, задание времени публикации.
+- Автоматическое решение капчи через Roboflow Inference.
+- Несколько аккаунтов: куки хранятся отдельно в `TK_cookies_<аккаунт>.json`.
+- Прокси, headless-режим, дополнительные «человеческие» задержки (`stealth`).
+- Обход детекции ботов: Playwright + `playwright-extra` и плагин `puppeteer-extra-plugin-stealth`.
+- Telegram-бот: очередь загрузки, live-доска статусов, пакетная заливка, загрузка по ссылкам через `yt-dlp`.
 
-## Features
+## Структура
 
-- **Bypass/Auto Solve Captchas:** Captchas won't slow you down, they get solved automatically.
-- **Upload with TikTok Sounds:** Add popular TikTok sounds to your videos. Search by name or pull straight from your favorites.
-- **Native Photo Posts:** Upload 1–35 JPG/PNG/WebP images as a real TikTok photo post (JavaScript port and Telegram bot) — no MP4 conversion needed.
-- **Schedule Uploads:** Queue videos for a specific time, up to 10 days out.
-- **Copyright Check:** Run a copyright check before uploading so you're not caught off guard later.
-- **Add Working Hashtags:** Hashtags that are clickable and actually show up as hashtags instead of text.
-- **Proxy Support:** Route your uploads through a proxy server of your choice.
-- **Multiple Accounts:** Handle as many TikTok accounts as you need without losing track of any of them.
-- **Telegram Integration:** Hook the uploader up to a Telegram bot. Check `/TelegramAutomation` for setup details.
-- **Phantomwright Stealth Engine:** Bot detection evasion baked in at the browser level — fingerprint spoofing, human-like interactions, and hardened browser flags out of the box.
+```
+tiktokautouploader/
+  index.js          # публичные экспорты: uploadTiktok, uploadPhotos, TikTokUploadError
+  function.js       # основная логика загрузки
+  browser.js        # общий браузер со stealth-плагином
+  login.js          # первичный вход в TikTok и сохранение кук
+  userSimulator.js  # имитация действий пользователя
+telegram_bot.js     # бот, очереди и кнопки
+upload.js           # минимальный пример загрузки из CLI
+Documentation.md    # подробности по параметрам и капче
+```
 
----
+## Требования
 
-## Bot Detection Evasion with Phantomwright
+- Node.js 20.17+ (для флага `--env-file-if-exists`; на более старых версиях передавайте переменные через окружение и запускайте `node telegram_bot.js`).
+- Chromium для Playwright:
 
-This library uses [**Phantomwright**](https://pypi.org/project/phantomwright/) as its browser engine instead of plain Playwright. Phantomwright is a patched, drop-in Playwright replacement specifically designed to evade bot detection.
+  ```bash
+  npx playwright install chromium
+  ```
 
----
+- Для загрузки по ссылкам в боте: `yt-dlp` и `ffmpeg`.
 
-## Installation
+## Установка
 
 ```bash
-pip install tiktokautouploader
+npm install
 ```
 
-> **Already installed?** Make sure you're on the latest version before running anything.
+## Первый вход в аккаунт
 
----
-
-## Pre-requisites
-
-**Node.js** is required since parts of this package run JavaScript under the hood. Grab it from [nodejs.org](https://nodejs.org/) if you don't have it. The JS dependencies (`playwright`, `playwright-extra`, `puppeteer-extra-plugin-stealth`) install themselves the first time you run the function — just make sure `npm` is in your PATH.
-
-**Browser binaries** also need to be installed once (run after installing library):
+Имя аккаунта задаётся вами произвольно и используется как имя файла кук:
 
 ```bash
-phantomwright_driver install chromium
+node upload.js ./video.mp4 "Моё описание" main test viral
 ```
 
----
+При первом запуске откроется видимое окно браузера — войдите в TikTok вручную. Куки сохранятся в `TK_cookies_main.json` в текущей папке и будут использоваться дальше. Если куки истекут, вход повторится автоматически.
 
-## Quick-Start
+Файлы `TK_cookies_*.json`, `.env`, `downloads/` и `telegram_bot.log` игнорируются Git — не публикуйте их.
 
-> It's worth reading `DOCUMENTATION.md` before diving in. The first time you use the function for an account you'll be asked to log in — this only happens once per account.
-
-NOTE: The first time you run the function, it may take a long while to run as JS libraries are built, this only occurs on first run
-
-### Upload with hashtags
-
-```python
-from tiktokautouploader import upload_tiktok
-
-upload_tiktok(
-    video='path/to/your/video.mp4',
-    description='Check out my latest TikTok video!',
-    accountname='mytiktokaccount',
-    hashtags=['#fun', '#viral']
-)
-```
-
-### Upload with a TikTok Sound
-
-```python
-# Search for a sound by name (default behaviour)
-upload_tiktok(video=video_path, description=description, accountname=accountname,
-              sound_name='trending_sound', sound_aud_vol='mix')
-
-# Pull a sound from your TikTok favorites instead
-upload_tiktok(video=video_path, description=description, accountname=accountname,
-              sound_name='saved_sound', sound_aud_vol='mix', search_mode='favorites')
-```
-
-`sound_aud_vol` controls the balance between your video's original audio and the TikTok sound: `'main'`, `'mix'`, or `'background'`. Check the docs for details.
-
-### Schedule an Upload
-
-```python
-upload_tiktok(video=video_path, description=description, accountname=accountname,
-              schedule='03:10', day=11)
-```
-
-### Native photo posts (JavaScript port)
-
-The JavaScript build exposes `uploadPhotos()` alongside `uploadTiktok()`. It uses TikTok Studio's **Photos** tab, so images stay images — no ffmpeg conversion or fake "image as video" uploads.
+## Использование из Node.js
 
 ```js
-const { uploadPhotos } = require('./tiktokautouploader');
+const { uploadTiktok, uploadPhotos, TikTokUploadError } = require('./tiktokautouploader');
 
-await uploadPhotos(
-  ['photo1.jpg', 'photo2.png'],
-  'My caption',
-  'mytiktokaccount',
-  {
-    title: 'Short title',       // optional, max 90 characters
-    hashtags: ['#fun', '#viral'],
-    soundName: 'trending sound', // optional; 'search' (default) or searchMode: 'favorites'
-    schedule: '18:30',           // optional, minute must be a multiple of 5
-  }
-);
+await uploadTiktok('video.mp4', 'Описание', 'main', {
+  hashtags: ['fun', 'viral'],
+  soundName: 'trending sound',
+  soundAudVol: 'mix',
+  schedule: '18:30',
+  day: 27,
+});
+
+await uploadPhotos(['1.jpg', '2.png'], 'Описание', 'main', {
+  title: 'Короткий заголовок',
+  hashtags: ['fun'],
+});
 ```
 
-- Up to **35 photos** per post; supported formats: JPG, JPEG, PNG, WebP.
-- `visibility`, `proxy`, `headless`, `stealth`, `suppressprint`, `day` and `searchMode` work the same as for videos.
-- `soundAudVol`, `coverImage` and `copyrightcheck` **do not apply** to photo posts.
-- In the Telegram bot, just send a photo or an album: an album becomes a single photo post.
+Обе функции возвращают `'Completed'` или `'Error'` и выбрасывают `TikTokUploadError` при ошибке.
 
-### Set a Custom Cover Image
+### Параметры `uploadTiktok(video, description, accountname, options)`
 
-TikTok's "Upload cover" tab accepts an image but silently discards it server-side — the video always ends up with a random auto-selected frame as the cover regardless of what you upload there. The only reliable approach is TikTok's native cover editor, which lets you pick any frame from the video.
+| Параметр | Тип | Описание |
+|---|---|---|
+| `coverImage` | `string` | Обложка; изображение должно быть последним кадром видео |
+| `hashtags` | `string[]` | Хэштеги с `#` или без |
+| `soundName` | `string` | Название звука TikTok |
+| `soundAudVol` | `string` | `mix`, `main` или `background` |
+| `schedule` | `string` | Время публикации `HH:MM` (местное) |
+| `day` | `number \| string` | Число месяца; только вместе с `schedule` |
+| `copyrightcheck` | `boolean` | Проверка на авторские права перед публикацией |
+| `visibility` | `string` | `everyone`, `friends` или `private` |
+| `proxy` | `object` | `{ server: 'host:port', username, password }` |
+| `searchMode` | `string` | `search` (поиск звука) или `favorites` |
+| `headless` | `boolean` | Скрытое окно браузера |
+| `stealth` | `boolean` | Дополнительные задержки между действиями |
+| `suppressprint` | `boolean` | Не выводить прогресс в консоль |
 
-The strategy: bake your desired cover image as the **last frame** of the MP4 at encode time, then pass `cover_image=` to `upload_tiktok()`. After the video uploads, the function opens the cover editor and drags the frame slider to the last frame before posting.
+### Параметры `uploadPhotos(photos, description, accountname, options)`
 
-**Step 1 — append your cover image as the last segment of the video:**
+Поддерживаются `title` (до 90 символов), `hashtags`, `soundName`, `searchMode`, `schedule`, `day`, `visibility`, `proxy`, `headless`, `stealth` и `suppressprint`. `soundAudVol` принимается для совместимости, но на фото-посты не влияет.
+
+## Telegram-бот
+
+Создайте бота у [@BotFather](https://t.me/BotFather), затем создайте `.env`:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF
+TIKTOK_ACCOUNT=main
+TIKTOK_HASHTAGS=#fyp,#viral
+TELEGRAM_ALLOWED_CHAT_IDS=123456789
+TELEGRAM_DOWNLOAD_DIR=./downloads
+```
+
+- `TELEGRAM_ALLOWED_CHAT_IDS` — id чатов через запятую; если не задано, бот открыт всем.
+- `TIKTOK_ACCOUNT` — аккаунт по умолчанию, можно сменить командой `/account`.
+
+Запуск:
 
 ```bash
-# Encode the static image as a short clip
-ffmpeg -loop 1 -i cover.png -t 2.5 -vf "scale=1080:1920,setsar=1" \
-  -c:v libx264 -pix_fmt yuv420p cover_clip.mp4
-
-# Concatenate it onto the end of your main video (concat demuxer)
-printf "file 'main.mp4'\nfile 'cover_clip.mp4'" > concat.txt
-ffmpeg -f concat -safe 0 -i concat.txt -c copy final.mp4
+npm run bot
 ```
 
-**Step 2 — pass `cover_image=` when uploading:**
+Как пользоваться:
 
-```python
-upload_tiktok(
-    video='final.mp4',        # last frame = your cover image
-    description='My caption',
-    accountname='myaccount',
-    cover_image='cover.png',  # triggers frame slider selection
-)
-```
+1. Пришлите видео (обычным сообщением или файлом) — оно встанет в очередь.
+2. Пришлите фото или альбом — получится один нативный фото-пост.
+3. Подпись к файлу становится описанием. Если файл без подписи, отправьте текст описания следующим сообщением — он привяжется к последнему файлу.
+4. Пришлите ссылку (можно несколько с новых строк) — бот скачает её через `yt-dlp`. Формат с описанием: `https://... | мой текст`.
+5. Нажмите «🚀 Залить на аккаунт» или «🚀 Залить все».
 
-`cover_image` defaults to `None` — fully backward compatible. If the cover editor can't be found or the drag fails for any reason, the upload proceeds normally without a custom cover.
+Команды:
 
-### Copyright Check Before Uploading
+| Команда | Действие |
+|---|---|
+| `/start`, `/help` | Справка |
+| `/account [имя]` | Показать или сменить аккаунт |
+| `/queue` | Живая доска очереди |
+| `/list` | Список задач с описаниями |
+| `/desc <№> <текст>` | Задать описание |
+| `/upload <№>` | Залить одну задачу |
+| `/uploadall` | Залить все готовые |
+| `/remove <№>` | Удалить задачу |
+| `/skip` | Пропустить ввод описания |
+| `/cancel` | Отменить ввод описаний |
 
-```python
-upload_tiktok(video=video_path, description=description, accountname=accountname,
-              hashtags=hashtags, copyrightcheck=True)
-```
+Ограничение Telegram для ботов — файлы до 20 МБ; большие видео присылайте ссылкой.
 
-> The upload will stop if your video fails the copyright check.
+## Частые проблемы
 
-### Run Headless with Stealth + Proxy
+- **Первый запуск для аккаунта открывает браузер.** Войдите в TikTok вручную — это нормально и требуется только один раз.
+- **Куки просят входа снова.** Значит, сессия истекла; войдите в открывшемся окне.
+- **`502 Bad Gateway` в логе polling.** Временная ошибка Telegram, библиотека сама повторяет запрос.
+- **Капча.** Решается автоматически; при смене интерфейса TikTok может потребоваться обновить селекторы в `function.js`.
 
-```python
-upload_tiktok(
-    video=video_path,
-    description=description,
-    accountname=accountname,
-    headless=True,       # no browser window
-    stealth=True,        # additional human-like delays on top of baseline evasion
-    suppressprint=True,  # no console output
-    proxy={              # optional proxy config — see docs for format
-        'server': 'http://yourproxy:port',
-        'username': 'user',
-        'password': 'pass'
-    }
-)
-```
+## Лицензия
 
----
-
-## Full Parameter Reference
-
-| Parameter | Type | Description |
-|---|---|---|
-| `video` | `str` | Path to the video file |
-| `description` | `str` | Caption for the video |
-| `accountname` | `str` | Which account to upload on |
-| `cover_image` | `str` *(opt)* | Path to a PNG/JPG to use as the cover. Must already be baked into the last frame of the video — see above. |
-| `hashtags` | `list` *(opt)* | List of hashtags to include |
-| `sound_name` | `str` *(opt)* | Name of the TikTok sound to use |
-| `sound_aud_vol` | `str` *(opt)* | Audio balance: `'main'`, `'mix'`, or `'background'` |
-| `schedule` | `str` *(opt)* | Upload time in `HH:MM` (your local time) |
-| `day` | `int` *(opt)* | Day to schedule the upload for |
-| `copyrightcheck` | `bool` *(opt)* | Run a copyright check before uploading |
-| `suppressprint` | `bool` *(opt)* | Silence all progress output from the function |
-| `headless` | `bool` *(opt)* | Run without a visible browser window |
-| `stealth` | `bool` *(opt)* | Add extra delays between operations on top of the always-on Phantomwright evasion |
-| `proxy` | `dict` *(opt)* | Proxy server config — see docs for the expected format |
-| `search_mode` | `str` *(opt)* | How to find the sound: `'search'` (default) or `'favorites'` |
-
----
-
-## Dependencies
-
-`phantomwright`, `requests`, `Pillow`, `inference` — all installed automatically with the package.
-
----
+MIT — см. [LICENSE.md](LICENSE.md).
