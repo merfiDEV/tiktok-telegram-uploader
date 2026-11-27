@@ -5,7 +5,8 @@
  * Возможности:
  *  - присылаете одно или несколько видео (файлом или как видео) — они встают в очередь;
  *  - присылаете фото или альбом фото — они заливаются нативным фото-постом TikTok (до 35 фото в одном посте);
- *  - подпись к видео/фото сразу становится описанием, описание можно поменять кнопкой «✏️ Описание»;
+ *  - подпись к видео/фото сразу становится описанием; если подписи нет, описание можно
+ *    отправить обычным текстом сразу после файла или поменять кнопкой «✏️ Описание»;
  *  - присылаете ссылку — бот скачивает видео через yt-dlp и предлагает залить его на аккаунт;
  *  - «🚀 Залить все» отправляет на TikTok все готовые видео по очереди (одно за другим).
  *
@@ -59,6 +60,8 @@ const ALBUM_DEBOUNCE_MS = 900;
 const MAX_DESCRIPTION_LENGTH = 2200;
 const LINK_RE = /https?:\/\/[^\s<>"']+/gi;
 const DOWNLOAD_TIMEOUT_MS = 15 * 60 * 1000;
+/** Сколько ждём текст-описание после добавленного видео/фото без подписи. */
+const PENDING_CAPTION_WINDOW_MS = 10 * 60 * 1000;
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 
@@ -74,6 +77,9 @@ const awaitingDescription = new Map();
 
 /** chatId -> очередь задач, для которых ещё нужно спросить описание */
 const descriptionQueues = new Map();
+
+/** chatId -> { taskId, expiresAt } для текста, отправленного сразу после файла без подписи. */
+const pendingCaptions = new Map();
 
 /** media_group_id -> собранные сообщения альбома фото */
 const photoAlbums = new Map();
@@ -134,6 +140,43 @@ function taskName(task) {
   }
   if (task.file) return path.basename(task.file);
   return task.label || 'видео';
+}
+
+/** Запоминаем задачу, для которой следующий текст в чате будет описанием. */
+function setPendingCaption(task) {
+  if (task.description) {
+    clearPendingCaptionForTask(task.id);
+    return;
+  }
+  pendingCaptions.set(task.chatId, {
+    taskId: task.id,
+    expiresAt: Date.now() + PENDING_CAPTION_WINDOW_MS,
+  });
+}
+
+function clearPendingCaptionForTask(taskId) {
+  for (const [chatId, pending] of pendingCaptions) {
+    if (pending.taskId === taskId) pendingCaptions.delete(chatId);
+  }
+}
+
+/** Возвращает задачу, если следующий текст действительно является её описанием. */
+function consumePendingCaption(chatId) {
+  const pending = pendingCaptions.get(chatId);
+  if (!pending) return null;
+  pendingCaptions.delete(chatId);
+  if (pending.expiresAt <= Date.now()) return null;
+
+  const task = tasks.get(pending.taskId);
+  if (
+    !task ||
+    task.chatId !== chatId ||
+    task.description ||
+    ['queued', 'uploading', 'done', 'failed'].includes(task.status)
+  ) {
+    return null;
+  }
+  return task;
 }
 
 function removeTaskFiles(task) {
@@ -432,6 +475,7 @@ function enqueueTask(task) {
     );
     return;
   }
+  clearPendingCaptionForTask(task.id);
   task.status = 'queued';
   uploadQueue.push(task);
   scheduleBoardUpdate(task.chatId);
@@ -502,6 +546,7 @@ async function handleVideoMessage(msg) {
     status: 'downloading',
     label: msg.document?.file_name || 'видео из Telegram',
   });
+  setPendingCaption(task);
   scheduleBoardUpdate(chatId);
 
   try {
@@ -517,6 +562,7 @@ async function handleVideoMessage(msg) {
   } catch (error) {
     task.status = 'failed';
     task.error = error.message;
+    clearPendingCaptionForTask(task.id);
     scheduleBoardUpdate(chatId);
     await bot.sendMessage(
       chatId,
@@ -557,6 +603,7 @@ async function createPhotoTask(chatId, messages) {
     description: messages.map((msg) => msg.caption).find(Boolean) || '',
     status: 'downloading',
   });
+  setPendingCaption(task);
   scheduleBoardUpdate(chatId);
 
   try {
@@ -576,6 +623,7 @@ async function createPhotoTask(chatId, messages) {
   } catch (error) {
     task.status = 'failed';
     task.error = error.message;
+    clearPendingCaptionForTask(task.id);
     scheduleBoardUpdate(chatId);
     await bot.sendMessage(chatId, `❌ Не удалось скачать фото #${task.id}: ${error.message}`);
   }
@@ -633,6 +681,13 @@ function parseLinkEntries(text) {
   return entries;
 }
 
+/** Текст состоит только из ссылок (возможно, с разделителями) — это не описание. */
+function isLinkOnlyText(text) {
+  if (parseLinkEntries(text).length === 0) return false;
+  const rest = text.replace(LINK_RE, '').replace(/[\s|;,.\-—]+/g, '');
+  return rest.length === 0;
+}
+
 /** Спрашивает описание для следующего видео из очереди. */
 async function askNextDescription(chatId) {
   const queue = descriptionQueues.get(chatId) || [];
@@ -647,8 +702,9 @@ async function askNextDescription(chatId) {
     awaitingDescription.set(chatId, task.id);
     await bot.sendMessage(
       chatId,
-      `✏️ Описание для #${task.id}: ${path.basename(task.file)}\n` +
-        'Отправьте текст описания или /skip, чтобы пропустить.'
+      `✏️ Описание для #${task.id}: ${escapeHtml(taskName(task))}\n` +
+        'Отправьте текст описания или /skip, чтобы пропустить.',
+      { parse_mode: 'HTML' }
     );
     return;
   }
@@ -657,6 +713,7 @@ async function askNextDescription(chatId) {
 }
 
 async function handleLinkBatch(chatId, entries) {
+  pendingCaptions.delete(chatId);
   // Все ссылки сразу становятся задачами «⏳ ждёт скачивания» — видно весь список.
   const created = entries.map(({ link, description }) =>
     addTask(chatId, { description, status: 'waiting', label: link })
@@ -710,7 +767,8 @@ function helpText() {
     '1. Пришлите одно или несколько видео (обычным видео или файлом).\n' +
     '2. Пришлите фото или альбом фото — бот сделает нативный фото-пост TikTok (до 35 фото в альбоме).\n' +
     '3. Пришлите одну или несколько ссылок — каждую с новой строки. Бот скачает всё пачкой и по очереди предложит описание.\n' +
-    '4. Подпись к видео/фото или текст после «|» в строке со ссылкой сразу станет описанием:\n' +
+    '4. Подпись к видео/фото или текст после «|» в строке со ссылкой сразу станет описанием.\n' +
+    '    Если файл прислан без подписи — просто отправьте текст описания следующим сообщением.\n' +
     '    <code>https://... | мое описание</code>\n' +
     '5. Нажмите «🚀 Залить на аккаунт» для одного файла или «🚀 Залить все» для всей пачки.\n\n' +
     '<b>Команды</b>\n' +
@@ -813,6 +871,7 @@ async function handleCommand(msg) {
         await bot.sendMessage(chatId, `Отправьте текст описания для #${task.id} (или /cancel).`);
         return;
       }
+      clearPendingCaptionForTask(task.id);
       task.description = description.slice(0, MAX_DESCRIPTION_LENGTH);
       await bot.sendMessage(chatId, `✅ Описание для #${task.id} сохранено.`);
       await sendTaskCard(chatId, task);
@@ -862,6 +921,7 @@ async function handleCommand(msg) {
         await bot.sendMessage(chatId, 'Эта задача уже заливается, дождитесь окончания.');
         return;
       }
+      clearPendingCaptionForTask(id);
       tasks.delete(id);
       removeFile(task.file);
       scheduleBoardUpdate(chatId);
@@ -882,6 +942,7 @@ async function handleCommand(msg) {
     case '/cancel':
       awaitingDescription.delete(chatId);
       descriptionQueues.delete(chatId);
+      pendingCaptions.delete(chatId);
       await bot.sendMessage(chatId, 'Ок, ввод описаний отменён.');
       return;
 
@@ -915,6 +976,7 @@ bot.on('message', async (msg) => {
     if (awaitingDescription.has(chatId)) {
       const taskId = awaitingDescription.get(chatId);
       awaitingDescription.delete(chatId);
+      clearPendingCaptionForTask(taskId);
       const task = tasks.get(taskId);
 
       if (!task) {
@@ -931,6 +993,17 @@ bot.on('message', async (msg) => {
     }
 
     const entries = parseLinkEntries(msg.text);
+    // Обычный текст сразу после видео/фото — это описание, а не запрос новых ссылок.
+    if (!isLinkOnlyText(msg.text)) {
+      const task = consumePendingCaption(chatId);
+      if (task) {
+        task.description = msg.text.trim().slice(0, MAX_DESCRIPTION_LENGTH);
+        await bot.sendMessage(chatId, `✅ Описание для #${task.id} сохранено.`);
+        await sendTaskCard(chatId, task);
+        return;
+      }
+    }
+
     if (entries.length > 0) {
       await handleLinkBatch(chatId, entries);
       return;
@@ -1019,6 +1092,7 @@ bot.on('callback_query', async (query) => {
         await bot.answerCallbackQuery(query.id, { text: 'Видео уже заливается' });
         return;
       }
+      clearPendingCaptionForTask(task.id);
       tasks.delete(task.id);
       removeTaskFiles(task);
       scheduleBoardUpdate(chatId);
